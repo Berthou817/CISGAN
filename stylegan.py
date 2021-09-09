@@ -14,9 +14,6 @@ class FC(nn.Module):
                  use_wscale=False,
                  lrmul=1.0,
                  bias=True):
-        """
-            The complete conversion of Dense/FC/Linear Layer of original Tensorflow version.
-        """
         super(FC, self).__init__()
         he_std = gain * in_channels ** (-0.5)  # He init
         if use_wscale:
@@ -43,10 +40,6 @@ class FC(nn.Module):
 
 class PixelNorm(nn.Module):
     def __init__(self, epsilon=1e-8):
-        """
-            @notice: avoid in-place ops.
-            https://discuss.pytorch.org/t/encounter-the-runtimeerror-one-of-the-variables-needed-for-gradient-computation-has-been-modified-by-an-inplace-operation/836/3
-        """
         super(PixelNorm, self).__init__()
         self.epsilon = epsilon
 
@@ -79,11 +72,10 @@ class G_mapping(nn.Module):
             FC(dlatent_size, dlatent_size, gain, lrmul=lrmul, use_wscale=use_wscale)
         )
 
-        self.normalize_latents = normalize_latents #True
-        self.resolution_log2 = int(np.log2(resolution)) # 6
-        self.num_layers = self.resolution_log2 * 2 - 2 # 10
+        self.normalize_latents = normalize_latents
+        self.resolution_log2 = int(np.log2(resolution))
+        self.num_layers = self.resolution_log2 * 2 - 2
         self.pixel_norm = PixelNorm()
-
 
     def forward(self, x):
         if self.normalize_latents:
@@ -101,7 +93,7 @@ class Conv3d(nn.Module):
                  lrmul=1,
                  bias=True):
         super().__init__()
-        he_std = gain * (input_channels * kernel_size ** 2) ** (-0.5)  # He init
+        he_std = gain * (input_channels * kernel_size ** 2) ** (-0.5)
         self.kernel_size = kernel_size
         if use_wscale:
             init_std = 1.0 / lrmul
@@ -126,11 +118,6 @@ class Conv3d(nn.Module):
 
 class Upscale3d(nn.Module):
     def __init__(self, factor=2, gain=1):
-        """
-            the first upsample method in G_synthesis.
-        :param factor:
-        :param gain:
-        """
         super().__init__()
         self.gain = gain
         self.factor = factor
@@ -157,9 +144,6 @@ class ApplyNoise(nn.Module):
         return x + self.weight.view(1, -1, 1, 1, 1) * noise.to(x.device)
 
 class ApplyStyle(nn.Module):
-    """
-        @ref: https://github.com/lernapparat/lernapparat/blob/master/style_gan/pytorch_style_gan.ipynb
-    """
     def __init__(self, latent_size, channels, use_wscale):
         super(ApplyStyle, self).__init__()
         self.linear = FC(latent_size,
@@ -169,11 +153,11 @@ class ApplyStyle(nn.Module):
 
     def forward(self, x, latent):
 
-        style = self.linear(latent) # style => [batch_size, n_channels*2]
+        style = self.linear(latent)
 
         shape = [-1, 2, x.size(1), 1, 1 ,1]
 
-        style = style.view(shape)    # [batch_size, 2, n_channels, ...]
+        style = style.view(shape)
 
         x = x * (style[:, 0] + 1.) + style[:, 1]
         return x
@@ -185,7 +169,7 @@ class InstanceNorm(nn.Module):
 
     def forward(self, x):
         x   = x - torch.mean(x, (2, 3), True)
-        tmp = torch.mul(x, x) # or x ** 2
+        tmp = torch.mul(x, x)
         tmp = torch.rsqrt(torch.mean(tmp, (2, 3), True) + self.epsilon)
         return x * tmp
 
@@ -237,29 +221,24 @@ class GBlock(nn.Module):
                  use_noise,
                  use_pixel_norm,
                  use_instance_norm,
-                 noise_input,        # noise
-                 dlatent_size=512,   # Disentangled latent (W) dimensionality.
-                 use_style=True,     # Enable style inputs?
-                 f=None,        # (Huge overload, if you dont have enough resouces, please pass it as `f = None`)Low-pass filter to apply when resampling activations. None = no filtering.
-                 factor=2,           # upsample factor.
-                 fmap_base=4096,     # Overall multiplier for the number of feature maps.
-                 fmap_decay=1.0,     # log2 feature map reduction when doubling the resolution.
-                 fmap_max=32,       # Maximum number of feature maps in any layer.
+                 noise_input,
+                 dlatent_size=512,
+                 use_style=True,
+                 f=None,
+                 factor=2,
+                 fmap_base=4096,
+                 fmap_decay=1.0,
+                 fmap_max=32,
                  ):
         super(GBlock, self).__init__()
 
         self.nf = [128,128,128,128,128,32]
-        # res
         self.res = res
 
-        # blur2d
-        #self.blur = Blur2d(f)
 
-        # noise
         self.noise_input = noise_input
-        
+
         self.up_sample = Upscale3d(factor)
-        # A Composition of LayerEpilogue and Conv2d.
         self.adaIn1 = LayerEpilogue(self.nf[res-2], dlatent_size, use_wscale, use_noise,
                                     use_pixel_norm, use_instance_norm, use_style)
         self.conv1  = Conv3d(input_channels=self.nf[res-2], output_channels=self.nf[res-2],
@@ -276,41 +255,31 @@ class GBlock(nn.Module):
         return x
 class G_synthesis(nn.Module):
     def __init__(self,
-                 dlatent_size,                       # Disentangled latent (W) dimensionality.
-                 resolution=128,                    # Output resolution (1024 x 1024 by default).
-                 fmap_base=4096,                     # Overall multiplier for the number of feature maps.
-                 num_channels=1,                     # Number of output color channels.
-                 structure='fixed',                  # 'fixed' = no progressive growing, 'linear' = human-readable, 'recursive' = efficient, 'auto' = select automatically.
-                 fmap_max=128,                       # Maximum number of feature maps in any layer.
-                 fmap_decay=1.0,                     # log2 feature map reduction when doubling the resolution.
-                 f=None,                        # (Huge overload, if you dont have enough resouces, please pass it as `f = None`)Low-pass filter to apply when resampling activations. None = no filtering.
-                 use_pixel_norm      = True,        # Enable pixelwise feature vector normalization?
-                 use_instance_norm   = True,        # Enable instance normalization?
-                 use_wscale = True,                  # Enable equalized learning rate?
-                 use_noise = True,                   # Enable noise inputs?
-                 use_style = True                    # Enable style inputs?
-                 ):                             # batch size.
-        """
-            2019.3.31
-        :param dlatent_size: 512 Disentangled latent(W) dimensionality.
-        :param resolution: 1024 x 1024.
-        :param fmap_base:
-        :param num_channels:
-        :param structure: only support 'fixed' mode.
-        :param fmap_max:
-        """
+                 dlatent_size,
+                 resolution=128,
+                 fmap_base=4096,
+                 num_channels=1,
+                 structure='fixed',
+                 fmap_max=128,
+                 fmap_decay=1.0,
+                 f=None,
+                 use_pixel_norm      = True,
+                 use_instance_norm   = True,
+                 use_wscale = True,
+                 use_noise = True,
+                 use_style = True
+                 ):
+
         super(G_synthesis, self).__init__()
 
-
+        #self.nf = lambda stage: min(int(fmap_base / (2.0 ** (stage * fmap_decay))), fmap_max)
         self.nf = [128,128,128,128,128,128,128,128,128,128,32,32,32,32,32]
         self.structure = structure
         self.resolution_log2 = int(np.log2(resolution))
-        # - 2 means we start from feature map with height and width equals 4.
-        # as this example, we get num_layers = 18.
+
         num_layers = self.resolution_log2 * 2 - 2 # 12
         self.num_layers = num_layers
 
-        # Noise inputs.
         self.noise_inputs = []
         for layer_idx in range(num_layers):
             res = layer_idx // 2 + 2
@@ -318,17 +287,12 @@ class G_synthesis(nn.Module):
             self.noise_inputs.append(torch.randn(*shape).to("cuda"))
 
 
-        # Blur2d
-        #self.blur = Blur2d(f)
-
-        # torgb: fixed mode
         self.channel_shrinkage = Conv3d(input_channels=32,
                                         output_channels=32,
                                         kernel_size=3,
                                         use_wscale=use_wscale)
         self.torgb = Conv3d(32, num_channels, kernel_size=1, gain=1, use_wscale=use_wscale)
 
-        # Initial Input Block
         self.const_input = nn.Parameter(torch.ones(1, self.nf[1], 4, 4, 4))
         self.bias = nn.Parameter(torch.ones(self.nf[1]))
         self.adaIn1 = LayerEpilogue(self.nf[1], dlatent_size, use_wscale, use_noise,
@@ -338,85 +302,67 @@ class G_synthesis(nn.Module):
                                     use_instance_norm, use_style)
         self.transform= Conv3d(128,32,1,1,use_wscale=use_wscale)
 
-        # Common Block
-        # 4 x 4 -> 8 x 8
+
         res = 3
         self.GBlock1 = GBlock(res, use_wscale, use_noise, use_pixel_norm, use_instance_norm,
                               self.noise_inputs)
 
-        # 8 x 8 -> 16 x 16
         res = 4
         self.GBlock2 = GBlock(res, use_wscale, use_noise, use_pixel_norm, use_instance_norm,
                               self.noise_inputs)
 
-        # 16 x 16 -> 32 x 32
         res = 5
         self.GBlock3 = GBlock(res, use_wscale, use_noise, use_pixel_norm, use_instance_norm,
                               self.noise_inputs)
 
-        # 32 x 32 -> 64 x 64
+
         res = 6
         self.GBlock4 = GBlock(res, use_wscale, use_noise, use_pixel_norm, use_instance_norm,
                               self.noise_inputs)
 
-        # 64 x 64 -> 128 x 128
+
         res = 7
         self.GBlock5 = GBlock(res, use_wscale, use_noise, use_pixel_norm, use_instance_norm,
                               self.noise_inputs)
-      
+
 
     def forward(self, dlatent):
 
 
-        """
-           dlatent: Disentangled latents (W), shape为[minibatch, num_layers, dlatent_size].
-        :param dlatent:
-        :return:
-        """
         images_out = None
-        # Fixed structure: simple and efficient, but does not support progressive growing.
+
         if self.structure == 'fixed':
-            # initial block 0:
+
             x = self.const_input.expand(dlatent.size(0), -1, -1, -1, -1)
 
             x = x + self.bias.view(1, -1, 1, 1, 1)
 
-            #
+
             x = self.adaIn1(x, self.noise_inputs[0], dlatent[:, 0])
 
-            #
-            #
+
+
             x = self.conv1(x)
 
-            #
+
             x = self.adaIn2(x, self.noise_inputs[1], dlatent[:, 1])
 
-            #
-            # # block 1:
-            # # 4 x 4 -> 8 x 8
-            #
+
             x = self.GBlock1(x, dlatent)
 
-            #
-            #
-            # # block 2:
-            # # 8 x 8 -> 16 x 16
+
             x = self.GBlock2(x, dlatent)
             #
-            # # block 3:
-            # # 16 x 16 -> 32 x 32
+
             x = self.GBlock3(x, dlatent)
             #
-            # # block 4:
-            # # 32 x 32 -> 64 x 64
+
             x = self.GBlock4(x, dlatent)
 
             x = self.transform(x)
 
 
 
-            # block 5:
-            # # 64 x 64 -> 128 x 128
             x = self.GBlock5(x, dlatent)
 
 
@@ -428,9 +374,9 @@ class G_synthesis(nn.Module):
 class StyleGenerator(nn.Module):
     def __init__(self,
                  mapping_fmaps=512,
-                 style_mixing_prob=0.9,       # Probability of mixing styles during training. None = disable.
-                 truncation_psi=0.5,          # Style strength multiplier for the truncation trick. None = disable.
-                 truncation_cutoff=12,          # Number of layers for which to apply the truncation trick. None = disable.
+                 style_mixing_prob=0.9,
+                 truncation_psi=0.5,
+                 truncation_cutoff=12,
                  **kwargs
                  ):
         super(StyleGenerator, self).__init__()
@@ -445,30 +391,21 @@ class StyleGenerator(nn.Module):
     def forward(self, latents1,pore):
 
         latents1 = torch.cat((latents1, pore), 1)
-        # latents1= latents1.data.cpu().numpy()
-        # label = label.data.cpu().numpy().reshape(latents1.shape[0], 1)
-        # latents1 = np.concatenate((latents1, label), axis=1)
-        # latents1 = torch.tensor(latents1).type(torch.FloatTensor).cuda()
+
 
 
         dlatents1, num_layers = self.mapping(latents1)
-        # let [N, O] -> [N, num_layers, O]
 
         dlatents1 = dlatents1.unsqueeze(1)
         dlatents1 = dlatents1.expand(-1, int(num_layers), -1)
 
 
-        # Apply truncation trick.
         if self.truncation_psi and self.truncation_cutoff:
             coefs = np.ones([1, num_layers, 1], dtype=np.float32)
             for i in range(num_layers):
                 if i < self.truncation_cutoff:
                     coefs[:, i, :] *= self.truncation_psi
-            """Linear interpolation.
-               a + (b - a) * t (a = 0)
-               reduce to
-               b * t
-            """
+
 
             dlatents1 = dlatents1 * torch.Tensor(coefs).to(dlatents1.device)
 
@@ -503,12 +440,12 @@ class discriminator(nn.Module):
 
         )
         self.regression = nn.Linear(512,1)
-    
-        # )
+
         self.pore = nn.Sequential(
             nn.Linear(512,256),
             nn.LeakyReLU(0.2),
             nn.Linear(256, 128),
+            nn.Sigmoid()
 
         )
     def forward(self,x):
